@@ -7,6 +7,7 @@ import string
 
 import libsql
 from telegram import (
+    CopyTextButton,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     KeyboardButton,
@@ -761,7 +762,7 @@ async def handle_menu_options(
         keyboard = [
             [
                 InlineKeyboardButton(
-                    "📋 Copy ID", callback_data=f"copy_id_{user.id}"
+                    "📋 Copy ID", copy_text=CopyTextButton(str(user.id))
                 )
             ]
         ]
@@ -806,7 +807,7 @@ async def handle_menu_options(
         keyboard = [
             [
                 InlineKeyboardButton(
-                    "📋 Copy Link", callback_data="copy_ref_link"
+                    "📋 Copy Link", copy_text=CopyTextButton(ref_link)
                 )
             ]
         ]
@@ -863,10 +864,6 @@ async def handle_universal_callbacks(
             parse_mode="HTML",
         )
 
-    elif data.startswith("copy_id_"):
-        await query.answer("📋 ID copied!", show_alert=True)
-    elif data == "copy_ref_link":
-        await query.answer("📋 Referral link copied!", show_alert=True)
     elif data == "cancel_new_gmail":
         context.user_data.pop("assigned_new_gmail", None)
         await query.answer("Task canceled.")
