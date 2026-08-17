@@ -25,10 +25,10 @@ from telegram.ext import (
 # ---------------------------------------------------------
 # CONFIGURATION
 # ---------------------------------------------------------
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "8999465388:AAGktYutx6GQ_F_2l4XbVirGm96hbaWRXvU")
+BOT_TOKEN = os.environ["BOT_TOKEN"]
 CHANNEL_USERNAME = "FastGmailMarket"
 BOT_USERNAME = "FastMailMarketBot"
-ADMIN_CHAT_ID = int(os.environ.get("ADMIN_CHAT_ID", "6006856675"))
+ADMIN_CHAT_ID = 6006856675  # fixed — not overridable via env/secrets
 
 # Financial Settings
 GMAIL_PRICE_NEW = 20.0
