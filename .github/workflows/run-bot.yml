@@ -2,7 +2,7 @@ name: Run Telegram Bot
 
 on:
   push:
-    branches: [master]
+    branches: [main]
   workflow_dispatch: {}
   schedule:
     # Restart every 5 hours so a fresh job picks up before GitHub's 6h job limit hits.
