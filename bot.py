@@ -3,8 +3,9 @@ import logging
 import os
 import random
 import re
-import sqlite3
 import string
+
+import libsql
 from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -30,6 +31,10 @@ CHANNEL_USERNAME = "FastGmailMarket"
 BOT_USERNAME = "FastMailMarketBot"
 ADMIN_CHAT_ID = int(os.environ["ADMIN_CHAT_ID"])
 
+# Turso (remote libSQL) — replaces local SQLite so data survives job restarts
+TURSO_DATABASE_URL = os.environ["TURSO_DATABASE_URL"]
+TURSO_AUTH_TOKEN = os.environ["TURSO_AUTH_TOKEN"]
+
 # Financial Settings
 GMAIL_PRICE_NEW = 20.0
 GMAIL_PRICE_OLD = 25.0
@@ -52,10 +57,10 @@ KEYWORDS = ["dev", "tech", "box", "net", "pro", "digital", "hub"]
 
 
 # ---------------------------------------------------------
-# DATABASE MANAGEMENT (SQLite)
+# DATABASE MANAGEMENT (Turso / remote libSQL)
 # ---------------------------------------------------------
 def init_db():
-    conn = sqlite3.connect("bot_data.db")
+    conn = libsql.connect(database=TURSO_DATABASE_URL, auth_token=TURSO_AUTH_TOKEN)
     cursor = conn.cursor()
 
     # Users table
@@ -97,11 +102,7 @@ def init_db():
 
 
 def get_db_connection():
-    conn = sqlite3.connect("bot_data.db")
-    # Avoid immediate "database is locked" errors when multiple handler
-    # threads hit the file at once; retry internally for up to 5s instead.
-    conn.execute("PRAGMA busy_timeout = 5000")
-    return conn
+    return libsql.connect(database=TURSO_DATABASE_URL, auth_token=TURSO_AUTH_TOKEN)
 
 
 def get_or_create_user(user_id: int, referrer_id: int = None) -> tuple:
@@ -319,6 +320,29 @@ def db_reject_withdrawal(wdr_id: str):
         conn.close()
 
 
+def db_get_admin_stats():
+    conn = get_db_connection()
+    try:
+        total_users = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+        pending_subs = conn.execute(
+            "SELECT COUNT(*) FROM submissions WHERE status = 'PENDING'"
+        ).fetchone()[0]
+        pending_wdrs = conn.execute(
+            "SELECT COUNT(*) FROM withdrawals WHERE status = 'PENDING'"
+        ).fetchone()[0]
+        total_balance = conn.execute(
+            "SELECT COALESCE(SUM(balance), 0) FROM users"
+        ).fetchone()[0]
+        return {
+            "total_users": total_users,
+            "pending_subs": pending_subs,
+            "pending_wdrs": pending_wdrs,
+            "total_balance": total_balance,
+        }
+    finally:
+        conn.close()
+
+
 # ---------------------------------------------------------
 # HELPER FUNCTIONS & FILTERS
 # ---------------------------------------------------------
@@ -330,6 +354,7 @@ MENU_TEXTS = [
     "💳 WITHDRAW",
     "👥 REFER",
     "💲 GMAIL PRICES",
+    "⚙️ ADMIN PANEL",
 ]
 MENU_FILTER = ~filters.Regex(
     f"^({'|'.join(re.escape(t) for t in MENU_TEXTS)})$"
@@ -360,13 +385,15 @@ def generate_gmail_credentials():
     }
 
 
-def get_home_keyboard():
+def get_home_keyboard(is_admin_user: bool = False):
     keyboard = [
         [KeyboardButton("📧 NEW GMAIL SELL"), KeyboardButton("📧 OLD GMAIL SELL")],
         [KeyboardButton("🎧 SUPPORT"), KeyboardButton("👤 PROFILE")],
         [KeyboardButton("💳 WITHDRAW"), KeyboardButton("👥 REFER")],
         [KeyboardButton("💲 GMAIL PRICES")],
     ]
+    if is_admin_user:
+        keyboard.append([KeyboardButton("⚙️ ADMIN PANEL")])
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
 
@@ -453,7 +480,7 @@ async def send_home_menu(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
         chat_id=chat_id,
         text=text,
         parse_mode="HTML",
-        reply_markup=get_home_keyboard(),
+        reply_markup=get_home_keyboard(is_admin(chat_id)),
     )
 
 
@@ -794,6 +821,22 @@ async def handle_menu_options(
             f"📊 <b>Current Gmail Prices</b>\n\n📧 <b>OLD GMAIL:</b> {GMAIL_PRICE_OLD} Tk\n📧 <b>NEW GMAIL:</b> {GMAIL_PRICE_NEW} Tk",
             parse_mode="HTML",
         )
+
+    elif text == "⚙️ ADMIN PANEL":
+        if not is_admin(user.id):
+            return
+        stats = await asyncio.to_thread(db_get_admin_stats)
+        msg_text = (
+            "⚙️ <b>Admin Panel</b>\n━━━━━━━\n"
+            f"👥 <b>Total Users:</b> {stats['total_users']}\n"
+            f"💰 <b>Total User Balance:</b> {stats['total_balance']} Tk\n"
+            f"📨 <b>Pending Submissions:</b> {stats['pending_subs']}\n"
+            f"💳 <b>Pending Withdrawals:</b> {stats['pending_wdrs']}\n\n"
+            f"📧 <b>NEW GMAIL Price:</b> {GMAIL_PRICE_NEW} Tk\n"
+            f"📧 <b>OLD GMAIL Price:</b> {GMAIL_PRICE_OLD} Tk\n"
+            f"👥 <b>Referral Bonus:</b> {REFERRAL_REWARD} Tk"
+        )
+        await update.message.reply_text(msg_text, parse_mode="HTML")
 
 
 # ---------------------------------------------------------
