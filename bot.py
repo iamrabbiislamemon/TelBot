@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import random
 import re
@@ -36,6 +37,12 @@ REFERRAL_REWARD = 2.0  # Reward in Tk per active referred user
 # Conversation States
 WAIT_OLD_GMAIL_EMAIL, WAIT_OLD_GMAIL_PASS = range(2)
 WAIT_WITHDRAW_INFO = 2
+
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+)
+logger = logging.getLogger(__name__)
 
 # Data Pools for Option 1: Dynamic Credential Generator
 FIRST_NAMES = ["Shahriar", "Tanvir", "Arafat", "Sabbir", "Naim", "Rayhan"]
@@ -89,59 +96,226 @@ def init_db():
 
 
 def get_db_connection():
-    return sqlite3.connect("bot_data.db")
+    conn = sqlite3.connect("bot_data.db")
+    # Avoid immediate "database is locked" errors when multiple handler
+    # threads hit the file at once; retry internally for up to 5s instead.
+    conn.execute("PRAGMA busy_timeout = 5000")
+    return conn
 
 
 def get_or_create_user(user_id: int, referrer_id: int = None) -> tuple:
     conn = get_db_connection()
-    cursor = conn.cursor()
+    try:
+        cursor = conn.cursor()
 
-    cursor.execute(
-        "SELECT user_id, balance, referred_by, ref_count FROM users WHERE user_id = ?",
-        (user_id,),
-    )
-    user = cursor.fetchone()
-
-    if not user:
-        # Validate referrer exists and isn't self
-        if referrer_id == user_id:
-            referrer_id = None
-
-        cursor.execute(
-            "INSERT INTO users (user_id, balance, referred_by, ref_count) VALUES (?, 0.0, ?, 0)",
-            (user_id, referrer_id),
-        )
-        conn.commit()
         cursor.execute(
             "SELECT user_id, balance, referred_by, ref_count FROM users WHERE user_id = ?",
             (user_id,),
         )
         user = cursor.fetchone()
 
-    conn.close()
-    return user
+        if not user:
+            # Validate referrer exists and isn't self
+            if referrer_id == user_id:
+                referrer_id = None
+
+            cursor.execute(
+                "INSERT INTO users (user_id, balance, referred_by, ref_count) VALUES (?, 0.0, ?, 0)",
+                (user_id, referrer_id),
+            )
+            conn.commit()
+            cursor.execute(
+                "SELECT user_id, balance, referred_by, ref_count FROM users WHERE user_id = ?",
+                (user_id,),
+            )
+            user = cursor.fetchone()
+
+        return user
+    finally:
+        conn.close()
 
 
 def get_user_balance(user_id: int) -> float:
     conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute(
-        "SELECT balance FROM users WHERE user_id = ?", (user_id,)
-    )
-    res = cursor.fetchone()
-    conn.close()
-    return res[0] if res else 0.0
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT balance FROM users WHERE user_id = ?", (user_id,)
+        )
+        res = cursor.fetchone()
+        return res[0] if res else 0.0
+    finally:
+        conn.close()
 
 
-def update_user_balance(user_id: int, amount: float):
+# ---------------------------------------------------------
+# DB HELPERS THAT NEED TO RUN ATOMICALLY (called via asyncio.to_thread
+# from handlers so a slow DB call never blocks the event loop, and each
+# state transition is gated by a single UPDATE ... WHERE status='PENDING'
+# so a double-tap / concurrent callback can't process the same row twice).
+# ---------------------------------------------------------
+def db_insert_submission(sub_id: str, user_id: int, email: str, password: str, reward: float):
     conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute(
-        "UPDATE users SET balance = balance + ? WHERE user_id = ?",
-        (amount, user_id),
-    )
-    conn.commit()
-    conn.close()
+    try:
+        conn.execute(
+            "INSERT INTO submissions VALUES (?, ?, ?, ?, ?, 'PENDING')",
+            (sub_id, user_id, email, password, reward),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def db_get_ref_count(user_id: int) -> int:
+    conn = get_db_connection()
+    try:
+        cursor = conn.execute(
+            "SELECT ref_count FROM users WHERE user_id = ?", (user_id,)
+        )
+        row = cursor.fetchone()
+        return row[0] if row else 0
+    finally:
+        conn.close()
+
+
+def db_create_withdrawal(user_id: int, method: str, account_no: str, amount: float):
+    """Atomically validates balance, deducts it, and inserts the withdrawal row.
+    Returns (wdr_id, remaining_balance) on success, or (None, current_balance) if
+    the amount is invalid — closing the race where two fast requests could both
+    read the same balance and jointly overdraw it."""
+    conn = get_db_connection()
+    try:
+        cursor = conn.execute(
+            "SELECT balance FROM users WHERE user_id = ?", (user_id,)
+        )
+        row = cursor.fetchone()
+        balance = row[0] if row else 0.0
+
+        if amount <= 0 or amount > balance:
+            return None, balance
+
+        wdr_id = f"WDR_{user_id}_{random.randint(10000, 99999)}"
+        conn.execute(
+            "UPDATE users SET balance = balance - ? WHERE user_id = ?",
+            (amount, user_id),
+        )
+        conn.execute(
+            "INSERT INTO withdrawals VALUES (?, ?, ?, ?, ?, 'PENDING')",
+            (wdr_id, user_id, method, account_no, amount),
+        )
+        conn.commit()
+        return wdr_id, balance - amount
+    finally:
+        conn.close()
+
+
+def db_approve_submission(sub_id: str):
+    """Atomically claims a PENDING submission, credits the seller, and pays out
+    any referral bonus. Returns (sub_user_id, reward, referrer_id) on success,
+    or None if the submission was already approved/rejected (or doesn't exist)."""
+    conn = get_db_connection()
+    try:
+        cursor = conn.execute(
+            "UPDATE submissions SET status = 'APPROVED' WHERE sub_id = ? AND status = 'PENDING'",
+            (sub_id,),
+        )
+        if cursor.rowcount == 0:
+            return None
+
+        cursor = conn.execute(
+            "SELECT user_id, reward FROM submissions WHERE sub_id = ?", (sub_id,)
+        )
+        sub_user_id, reward = cursor.fetchone()
+
+        conn.execute(
+            "UPDATE users SET balance = balance + ? WHERE user_id = ?",
+            (reward, sub_user_id),
+        )
+
+        cursor = conn.execute(
+            "SELECT referred_by FROM users WHERE user_id = ?", (sub_user_id,)
+        )
+        ref_row = cursor.fetchone()
+        referrer_id = ref_row[0] if ref_row else None
+        if referrer_id:
+            conn.execute(
+                "UPDATE users SET balance = balance + ? WHERE user_id = ?",
+                (REFERRAL_REWARD, referrer_id),
+            )
+            conn.execute(
+                "UPDATE users SET ref_count = ref_count + 1, referred_by = NULL WHERE user_id = ?",
+                (sub_user_id,),
+            )
+
+        conn.commit()
+        return sub_user_id, reward, referrer_id
+    finally:
+        conn.close()
+
+
+def db_reject_submission(sub_id: str):
+    conn = get_db_connection()
+    try:
+        cursor = conn.execute(
+            "UPDATE submissions SET status = 'REJECTED' WHERE sub_id = ? AND status = 'PENDING'",
+            (sub_id,),
+        )
+        if cursor.rowcount == 0:
+            return None
+
+        cursor = conn.execute(
+            "SELECT user_id, email FROM submissions WHERE sub_id = ?", (sub_id,)
+        )
+        row = cursor.fetchone()
+        conn.commit()
+        return row
+    finally:
+        conn.close()
+
+
+def db_approve_withdrawal(wdr_id: str):
+    conn = get_db_connection()
+    try:
+        cursor = conn.execute(
+            "UPDATE withdrawals SET status = 'APPROVED' WHERE wdr_id = ? AND status = 'PENDING'",
+            (wdr_id,),
+        )
+        if cursor.rowcount == 0:
+            return None
+
+        cursor = conn.execute(
+            "SELECT user_id, amount, method, account FROM withdrawals WHERE wdr_id = ?",
+            (wdr_id,),
+        )
+        row = cursor.fetchone()
+        conn.commit()
+        return row
+    finally:
+        conn.close()
+
+
+def db_reject_withdrawal(wdr_id: str):
+    conn = get_db_connection()
+    try:
+        cursor = conn.execute(
+            "UPDATE withdrawals SET status = 'REJECTED' WHERE wdr_id = ? AND status = 'PENDING'",
+            (wdr_id,),
+        )
+        if cursor.rowcount == 0:
+            return None
+
+        cursor = conn.execute(
+            "SELECT user_id, amount FROM withdrawals WHERE wdr_id = ?", (wdr_id,)
+        )
+        user_id, amount = cursor.fetchone()
+        conn.execute(
+            "UPDATE users SET balance = balance + ? WHERE user_id = ?",
+            (amount, user_id),
+        )
+        conn.commit()
+        return user_id, amount
+    finally:
+        conn.close()
 
 
 # ---------------------------------------------------------
@@ -156,7 +330,9 @@ MENU_TEXTS = [
     "👥 REFER",
     "💲 GMAIL PRICES",
 ]
-MENU_FILTER = ~filters.Regex(f"^({'|'.join(MENU_TEXTS)})$")
+MENU_FILTER = ~filters.Regex(
+    f"^({'|'.join(re.escape(t) for t in MENU_TEXTS)})$"
+)
 
 
 def is_admin(user_id: int) -> bool:
@@ -202,6 +378,9 @@ async def check_membership(
         )
         return member.status in ["creator", "administrator", "member"]
     except Exception:
+        logger.warning(
+            "Membership check failed for user_id=%s", user_id, exc_info=True
+        )
         return False
 
 
@@ -219,7 +398,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except ValueError:
             referrer_id = None
 
-    get_or_create_user(user_id, referrer_id)
+    await asyncio.to_thread(get_or_create_user, user_id, referrer_id)
 
     if await check_membership(user_id, context):
         await send_home_menu(update.effective_chat.id, context)
@@ -347,16 +526,10 @@ async def receive_old_gmail_password(
     password = update.message.text.strip()
     email = context.user_data.get("temp_old_email")
 
-    conn = get_db_connection()
-    cursor = conn.cursor()
     sub_id = f"SUB_{user.id}_{random.randint(10000, 99999)}"
-
-    cursor.execute(
-        "INSERT INTO submissions VALUES (?, ?, ?, ?, ?, 'PENDING')",
-        (sub_id, user.id, email, password, GMAIL_PRICE_OLD),
+    await asyncio.to_thread(
+        db_insert_submission, sub_id, user.id, email, password, GMAIL_PRICE_OLD
     )
-    conn.commit()
-    conn.close()
 
     await update.message.reply_text(
         "🎉 <b>Old Gmail Submitted Successfully!</b>\nSent to Admin for manual review.",
@@ -407,7 +580,7 @@ async def start_withdraw_callback(
 
     method = query.data.replace("withdraw_", "").upper()
     user_id = query.from_user.id
-    balance = get_user_balance(user_id)
+    balance = await asyncio.to_thread(get_user_balance, user_id)
 
     if balance <= 0:
         await query.message.reply_text(
@@ -433,7 +606,6 @@ async def receive_withdraw_details(
     user = update.effective_user
     text = update.message.text.strip()
     method = context.user_data.get("withdraw_method", "UNKNOWN")
-    current_bal = get_user_balance(user.id)
 
     parts = text.split()
     if len(parts) < 2:
@@ -449,25 +621,19 @@ async def receive_withdraw_details(
         await update.message.reply_text("❌ Enter a numeric amount.")
         return WAIT_WITHDRAW_INFO
 
-    if amount <= 0 or amount > current_bal:
+    # Validates the balance, deducts it, and inserts the withdrawal row in a
+    # single DB transaction so two fast/concurrent requests can't both pass
+    # the balance check and jointly overdraw the account.
+    wdr_id, balance_info = await asyncio.to_thread(
+        db_create_withdrawal, user.id, method, account_no, amount
+    )
+    if wdr_id is None:
         await update.message.reply_text(
-            f"❌ Invalid Amount! Requested: {amount} Tk | Available: {current_bal} Tk"
+            f"❌ Invalid Amount! Requested: {amount} Tk | Available: {balance_info} Tk"
         )
         return WAIT_WITHDRAW_INFO
 
-    # Deduct balance immediately
-    update_user_balance(user.id, -amount)
-    remaining_bal = get_user_balance(user.id)
-
-    wdr_id = f"WDR_{user.id}_{random.randint(10000, 99999)}"
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute(
-        "INSERT INTO withdrawals VALUES (?, ?, ?, ?, ?, 'PENDING')",
-        (wdr_id, user.id, method, account_no, amount),
-    )
-    conn.commit()
-    conn.close()
+    remaining_bal = balance_info
 
     await update.message.reply_text(
         f"✅ <b>Withdrawal Request Received!</b>\n\n"
@@ -526,7 +692,7 @@ async def handle_menu_options(
 ):
     text = update.message.text
     user = update.effective_user
-    balance = get_user_balance(user.id)
+    balance = await asyncio.to_thread(get_user_balance, user.id)
 
     if text == "📧 NEW GMAIL SELL":
         await handle_new_gmail_sell(update, context)
@@ -556,13 +722,7 @@ async def handle_menu_options(
         )
 
     elif text == "👤 PROFILE":
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute(
-            "SELECT ref_count FROM users WHERE user_id = ?", (user.id,)
-        )
-        ref_count = cursor.fetchone()[0]
-        conn.close()
+        ref_count = await asyncio.to_thread(db_get_ref_count, user.id)
 
         msg_text = (
             f"👤 <b>Name:</b> {user.first_name}\n"
@@ -676,20 +836,14 @@ async def handle_universal_callbacks(
             return
 
         sub_id = f"SUB_{user.id}_{random.randint(10000, 99999)}"
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute(
-            "INSERT INTO submissions VALUES (?, ?, ?, ?, ?, 'PENDING')",
-            (
-                sub_id,
-                user.id,
-                creds["email"],
-                creds["password"],
-                GMAIL_PRICE_NEW,
-            ),
+        await asyncio.to_thread(
+            db_insert_submission,
+            sub_id,
+            user.id,
+            creds["email"],
+            creds["password"],
+            GMAIL_PRICE_NEW,
         )
-        conn.commit()
-        conn.close()
 
         await query.answer("Submitted!")
         await query.message.edit_text(
@@ -734,39 +888,12 @@ async def handle_universal_callbacks(
             return
         sub_id = data.replace("adm_app_sub_", "")
 
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute(
-            "SELECT user_id, reward, status FROM submissions WHERE sub_id = ?",
-            (sub_id,),
-        )
-        sub = cursor.fetchone()
+        result = await asyncio.to_thread(db_approve_submission, sub_id)
 
-        if sub and sub[2] == "PENDING":
-            sub_user_id, reward = sub[0], sub[1]
-            cursor.execute(
-                "UPDATE submissions SET status = 'APPROVED' WHERE sub_id = ?",
-                (sub_id,),
-            )
-            conn.commit()
+        if result:
+            sub_user_id, reward, referrer_id = result
 
-            # Credit user balance
-            update_user_balance(sub_user_id, reward)
-
-            # Referral Commission Logic on First Submission
-            cursor.execute(
-                "SELECT referred_by FROM users WHERE user_id = ?",
-                (sub_user_id,),
-            )
-            ref_data = cursor.fetchone()
-            if ref_data and ref_data[0]:
-                referrer_id = ref_data[0]
-                update_user_balance(referrer_id, REFERRAL_REWARD)
-                cursor.execute(
-                    "UPDATE users SET ref_count = ref_count + 1, referred_by = NULL WHERE user_id = ?",
-                    (sub_user_id,),
-                )
-                conn.commit()
+            if referrer_id:
                 await context.bot.send_message(
                     chat_id=referrer_id,
                     text=f"🎉 <b>Referral Bonus!</b> You earned <b>+{REFERRAL_REWARD} Tk</b> for an active referral.",
@@ -782,30 +909,18 @@ async def handle_universal_callbacks(
                 text=f"🎉 <b>Gmail Approved!</b>\n💰 <b>+{reward} Tk</b> added to profile.",
                 parse_mode="HTML",
             )
-
-        conn.close()
-        await query.answer("Approved!")
+            await query.answer("Approved!")
+        else:
+            await query.answer("Already processed.", show_alert=True)
 
     elif data.startswith("adm_rej_sub_"):
         if not is_admin(user.id):
             return
         sub_id = data.replace("adm_rej_sub_", "")
 
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute(
-            "SELECT user_id, email, status FROM submissions WHERE sub_id = ?",
-            (sub_id,),
-        )
-        sub = cursor.fetchone()
+        sub = await asyncio.to_thread(db_reject_submission, sub_id)
 
-        if sub and sub[2] == "PENDING":
-            cursor.execute(
-                "UPDATE submissions SET status = 'REJECTED' WHERE sub_id = ?",
-                (sub_id,),
-            )
-            conn.commit()
-
+        if sub:
             await query.edit_message_text(
                 f"{query.message.text}\n\n❌ <b>REJECTED</b>", parse_mode="HTML"
             )
@@ -814,9 +929,9 @@ async def handle_universal_callbacks(
                 text=f"❌ <b>Gmail Submission Rejected.</b> Verification failed for <code>{sub[1]}</code>",
                 parse_mode="HTML",
             )
-
-        conn.close()
-        await query.answer("Rejected.")
+            await query.answer("Rejected.")
+        else:
+            await query.answer("Already processed.", show_alert=True)
 
     # Admin Withdrawal Actions
     elif data.startswith("adm_app_wdr_"):
@@ -824,21 +939,9 @@ async def handle_universal_callbacks(
             return
         wdr_id = data.replace("adm_app_wdr_", "")
 
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute(
-            "SELECT user_id, amount, method, account, status FROM withdrawals WHERE wdr_id = ?",
-            (wdr_id,),
-        )
-        wdr = cursor.fetchone()
+        wdr = await asyncio.to_thread(db_approve_withdrawal, wdr_id)
 
-        if wdr and wdr[4] == "PENDING":
-            cursor.execute(
-                "UPDATE withdrawals SET status = 'APPROVED' WHERE wdr_id = ?",
-                (wdr_id,),
-            )
-            conn.commit()
-
+        if wdr:
             await query.edit_message_text(
                 f"{query.message.text}\n\n✅ <b>STATUS: PAID & SENT</b>",
                 parse_mode="HTML",
@@ -848,33 +951,18 @@ async def handle_universal_callbacks(
                 text=f"🎉 <b>Withdrawal Sent!</b> {wdr[1]} Tk via {wdr[2]} (Acc: {wdr[3]}).",
                 parse_mode="HTML",
             )
-
-        conn.close()
-        await query.answer("Paid!")
+            await query.answer("Paid!")
+        else:
+            await query.answer("Already processed.", show_alert=True)
 
     elif data.startswith("adm_rej_wdr_"):
         if not is_admin(user.id):
             return
         wdr_id = data.replace("adm_rej_wdr_", "")
 
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute(
-            "SELECT user_id, amount, status FROM withdrawals WHERE wdr_id = ?",
-            (wdr_id,),
-        )
-        wdr = cursor.fetchone()
+        wdr = await asyncio.to_thread(db_reject_withdrawal, wdr_id)
 
-        if wdr and wdr[2] == "PENDING":
-            cursor.execute(
-                "UPDATE withdrawals SET status = 'REJECTED' WHERE wdr_id = ?",
-                (wdr_id,),
-            )
-            conn.commit()
-
-            # Refund reserved balance
-            update_user_balance(wdr[0], wdr[1])
-
+        if wdr:
             await query.edit_message_text(
                 f"{query.message.text}\n\n❌ <b>REJECTED & REFUNDED</b>",
                 parse_mode="HTML",
@@ -884,9 +972,13 @@ async def handle_universal_callbacks(
                 text=f"❌ <b>Withdrawal Rejected.</b> {wdr[1]} Tk refunded to your profile balance.",
                 parse_mode="HTML",
             )
+            await query.answer("Refunded.")
+        else:
+            await query.answer("Already processed.", show_alert=True)
 
-        conn.close()
-        await query.answer("Refunded.")
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    logger.error("Unhandled exception while processing an update", exc_info=context.error)
 
 
 # ---------------------------------------------------------
@@ -896,6 +988,7 @@ def main():
     init_db()
 
     app = Application.builder().token(BOT_TOKEN).build()
+    app.add_error_handler(error_handler)
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(
