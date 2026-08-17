@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import os
 import random
 import re
 import sqlite3
@@ -24,10 +25,10 @@ from telegram.ext import (
 # ---------------------------------------------------------
 # CONFIGURATION
 # ---------------------------------------------------------
-BOT_TOKEN = "YOUR_TELEGRAM_BOT_TOKEN"
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "8999465388:AAGktYutx6GQ_F_2l4XbVirGm96hbaWRXvU")
 CHANNEL_USERNAME = "FastGmailMarket"
-BOT_USERNAME = "fast_gmail_sell_bot"
-ADMIN_CHAT_ID = 123456789  # Replace with your numerical Telegram User ID
+BOT_USERNAME = "FastMailMarketBot"
+ADMIN_CHAT_ID = int(os.environ.get("ADMIN_CHAT_ID", "6006856675"))
 
 # Financial Settings
 GMAIL_PRICE_NEW = 20.0
