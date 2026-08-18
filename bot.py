@@ -36,14 +36,18 @@ ADMIN_CHAT_ID = int(os.environ["ADMIN_CHAT_ID"])
 TURSO_DATABASE_URL = os.environ["TURSO_DATABASE_URL"]
 TURSO_AUTH_TOKEN = os.environ["TURSO_AUTH_TOKEN"]
 
-# Financial Settings
-GMAIL_PRICE_NEW = 20.0
-GMAIL_PRICE_OLD = 25.0
-REFERRAL_REWARD = 2.0  # Reward in Tk per active referred user
+# Financial Settings — defaults only; live values are stored in the
+# `settings` DB table and editable from the admin panel at runtime.
+DEFAULT_SETTINGS = {
+    "gmail_price_new": "20.0",
+    "gmail_price_old": "25.0",
+    "referral_reward": "2.0",
+}
 
 # Conversation States
 WAIT_OLD_GMAIL_EMAIL, WAIT_OLD_GMAIL_PASS = range(2)
 WAIT_WITHDRAW_INFO = 2
+ADMIN_MENU, WAIT_ADMIN_VALUE = range(3, 5)
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -95,6 +99,23 @@ def init_db():
             account TEXT,
             amount REAL,
             status TEXT
+        )
+    """)
+
+    # Admin-editable settings (prices, referral bonus, ...)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+    """)
+
+    # Support contacts shown in the Support menu (admin-managed)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS support_contacts (
+            contact_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            label TEXT,
+            url TEXT
         )
     """)
 
@@ -240,10 +261,17 @@ def db_approve_submission(sub_id: str):
         )
         ref_row = cursor.fetchone()
         referrer_id = ref_row[0] if ref_row else None
+        referral_bonus = 0.0
         if referrer_id:
+            setting_row = conn.execute(
+                "SELECT value FROM settings WHERE key = 'referral_reward'"
+            ).fetchone()
+            referral_bonus = float(
+                setting_row[0] if setting_row else DEFAULT_SETTINGS["referral_reward"]
+            )
             conn.execute(
                 "UPDATE users SET balance = balance + ? WHERE user_id = ?",
-                (REFERRAL_REWARD, referrer_id),
+                (referral_bonus, referrer_id),
             )
             conn.execute(
                 "UPDATE users SET ref_count = ref_count + 1, referred_by = NULL WHERE user_id = ?",
@@ -251,7 +279,7 @@ def db_approve_submission(sub_id: str):
             )
 
         conn.commit()
-        return sub_user_id, reward, referrer_id
+        return sub_user_id, reward, referrer_id, referral_bonus
     finally:
         conn.close()
 
@@ -340,6 +368,63 @@ def db_get_admin_stats():
             "pending_wdrs": pending_wdrs,
             "total_balance": total_balance,
         }
+    finally:
+        conn.close()
+
+
+def db_get_all_settings() -> dict:
+    conn = get_db_connection()
+    try:
+        rows = conn.execute("SELECT key, value FROM settings").fetchall()
+        settings = dict(DEFAULT_SETTINGS)
+        settings.update({key: value for key, value in rows})
+        return settings
+    finally:
+        conn.close()
+
+
+def db_set_setting(key: str, value: str):
+    conn = get_db_connection()
+    try:
+        conn.execute(
+            "INSERT INTO settings (key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (key, value),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def db_list_support_contacts():
+    conn = get_db_connection()
+    try:
+        return conn.execute(
+            "SELECT contact_id, label, url FROM support_contacts ORDER BY contact_id"
+        ).fetchall()
+    finally:
+        conn.close()
+
+
+def db_add_support_contact(label: str, url: str):
+    conn = get_db_connection()
+    try:
+        conn.execute(
+            "INSERT INTO support_contacts (label, url) VALUES (?, ?)", (label, url)
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def db_remove_support_contact(contact_id: int) -> bool:
+    conn = get_db_connection()
+    try:
+        cursor = conn.execute(
+            "DELETE FROM support_contacts WHERE contact_id = ?", (contact_id,)
+        )
+        conn.commit()
+        return cursor.rowcount > 0
     finally:
         conn.close()
 
@@ -555,9 +640,12 @@ async def receive_old_gmail_password(
     password = update.message.text.strip()
     email = context.user_data.get("temp_old_email")
 
+    settings = await asyncio.to_thread(db_get_all_settings)
+    price_old = float(settings["gmail_price_old"])
+
     sub_id = f"SUB_{user.id}_{random.randint(10000, 99999)}"
     await asyncio.to_thread(
-        db_insert_submission, sub_id, user.id, email, password, GMAIL_PRICE_OLD
+        db_insert_submission, sub_id, user.id, email, password, price_old
     )
 
     await update.message.reply_text(
@@ -572,7 +660,7 @@ async def receive_old_gmail_password(
         f"🆔 <b>User ID:</b> <code>{user.id}</code>\n"
         f"✉️ <b>Email:</b> <code>{email}</code>\n"
         f"🔑 <b>Password:</b> <code>{password}</code>\n"
-        f"💰 <b>Reward:</b> {GMAIL_PRICE_OLD} Tk\n"
+        f"💰 <b>Reward:</b> {price_old} Tk\n"
         "━━━━━━━━━━━━━━━━━━━━━━"
     )
     keyboard = InlineKeyboardMarkup(
@@ -714,6 +802,210 @@ async def cancel_flow(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ---------------------------------------------------------
+# ADMIN SETTINGS FLOW
+# ---------------------------------------------------------
+def build_admin_main_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "💲 New Gmail Price", callback_data="adm_menu_price_new"
+                ),
+                InlineKeyboardButton(
+                    "💲 Old Gmail Price", callback_data="adm_menu_price_old"
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    "🎁 Referral Bonus", callback_data="adm_menu_referral"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "🛠 Support Contacts", callback_data="adm_menu_support"
+                )
+            ],
+            [InlineKeyboardButton("📊 Stats", callback_data="adm_menu_stats")],
+            [InlineKeyboardButton("✖️ Close", callback_data="adm_menu_close")],
+        ]
+    )
+
+
+async def build_support_submenu():
+    contacts = await asyncio.to_thread(db_list_support_contacts)
+    rows = [
+        [
+            InlineKeyboardButton(
+                f"🗑 Remove {label}", callback_data=f"adm_menu_support_del_{contact_id}"
+            )
+        ]
+        for contact_id, label, url in contacts
+    ]
+    rows.append(
+        [InlineKeyboardButton("➕ Add Contact", callback_data="adm_menu_support_add")]
+    )
+    rows.append([InlineKeyboardButton("⬅️ Back", callback_data="adm_menu_back")])
+
+    text = "🛠 <b>Support Contacts</b>\n━━━━━━━\n"
+    if contacts:
+        text += "\n".join(f"• {label} — {url}" for _, label, url in contacts)
+    else:
+        text += "<i>No contacts added yet.</i>"
+
+    return text, InlineKeyboardMarkup(rows)
+
+
+async def open_admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return ConversationHandler.END
+
+    await update.message.reply_text(
+        "⚙️ <b>Admin Panel</b>\nSelect what you want to manage:",
+        parse_mode="HTML",
+        reply_markup=build_admin_main_menu(),
+    )
+    return ADMIN_MENU
+
+
+ADMIN_EDIT_TARGETS = {
+    "adm_menu_price_new": ("gmail_price_new", "New Gmail Price"),
+    "adm_menu_price_old": ("gmail_price_old", "Old Gmail Price"),
+    "adm_menu_referral": ("referral_reward", "Referral Bonus"),
+}
+
+
+async def handle_admin_menu_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+):
+    query = update.callback_query
+    if not is_admin(query.from_user.id):
+        await query.answer()
+        return ConversationHandler.END
+
+    data = query.data
+
+    if data == "adm_menu_close":
+        await query.answer()
+        await query.edit_message_text("⚙️ Admin panel closed.")
+        return ConversationHandler.END
+
+    if data == "adm_menu_back":
+        await query.answer()
+        await query.edit_message_text(
+            "⚙️ <b>Admin Panel</b>\nSelect what you want to manage:",
+            parse_mode="HTML",
+            reply_markup=build_admin_main_menu(),
+        )
+        return ADMIN_MENU
+
+    if data == "adm_menu_stats":
+        await query.answer()
+        stats = await asyncio.to_thread(db_get_admin_stats)
+        settings = await asyncio.to_thread(db_get_all_settings)
+        text = (
+            "📊 <b>Bot Stats</b>\n━━━━━━━\n"
+            f"👥 <b>Total Users:</b> {stats['total_users']}\n"
+            f"💰 <b>Total User Balance:</b> {stats['total_balance']} Tk\n"
+            f"📨 <b>Pending Submissions:</b> {stats['pending_subs']}\n"
+            f"💳 <b>Pending Withdrawals:</b> {stats['pending_wdrs']}\n\n"
+            f"📧 <b>NEW GMAIL Price:</b> {settings['gmail_price_new']} Tk\n"
+            f"📧 <b>OLD GMAIL Price:</b> {settings['gmail_price_old']} Tk\n"
+            f"👥 <b>Referral Bonus:</b> {settings['referral_reward']} Tk"
+        )
+        await query.edit_message_text(
+            text,
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("⬅️ Back", callback_data="adm_menu_back")]]
+            ),
+        )
+        return ADMIN_MENU
+
+    if data == "adm_menu_support":
+        await query.answer()
+        text, markup = await build_support_submenu()
+        await query.edit_message_text(text, parse_mode="HTML", reply_markup=markup)
+        return ADMIN_MENU
+
+    if data.startswith("adm_menu_support_del_"):
+        contact_id = int(data.replace("adm_menu_support_del_", ""))
+        removed = await asyncio.to_thread(db_remove_support_contact, contact_id)
+        await query.answer("Removed." if removed else "Already removed.")
+        text, markup = await build_support_submenu()
+        await query.edit_message_text(text, parse_mode="HTML", reply_markup=markup)
+        return ADMIN_MENU
+
+    if data == "adm_menu_support_add":
+        await query.answer()
+        context.user_data["admin_edit_target"] = "support_add"
+        await query.edit_message_text(
+            "➕ <b>Add Support Contact</b>\n\n"
+            "Reply with: <code>Label | https://t.me/username</code>\n"
+            "<i>Example: WhatsApp | https://wa.me/8801700000000</i>",
+            parse_mode="HTML",
+        )
+        return WAIT_ADMIN_VALUE
+
+    if data in ADMIN_EDIT_TARGETS:
+        key, label = ADMIN_EDIT_TARGETS[data]
+        await query.answer()
+        context.user_data["admin_edit_target"] = key
+        await query.edit_message_text(
+            f"✏️ <b>Edit {label}</b>\n\nReply with the new amount (numbers only, e.g. 22.5):",
+            parse_mode="HTML",
+        )
+        return WAIT_ADMIN_VALUE
+
+    await query.answer()
+    return ADMIN_MENU
+
+
+async def receive_admin_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    target = context.user_data.get("admin_edit_target")
+    text = update.message.text.strip()
+
+    if target in ("gmail_price_new", "gmail_price_old", "referral_reward"):
+        try:
+            value = float(text)
+            if value < 0:
+                raise ValueError
+        except ValueError:
+            await update.message.reply_text(
+                "❌ Enter a valid positive number, e.g. 22.5"
+            )
+            return WAIT_ADMIN_VALUE
+
+        await asyncio.to_thread(db_set_setting, target, str(value))
+        context.user_data.pop("admin_edit_target", None)
+        await update.message.reply_text(f"✅ Updated. New value: {value} Tk")
+        return ConversationHandler.END
+
+    if target == "support_add":
+        if "|" not in text:
+            await update.message.reply_text(
+                "❌ Invalid format. Use: Label | https://t.me/username"
+            )
+            return WAIT_ADMIN_VALUE
+
+        label, url = (part.strip() for part in text.split("|", 1))
+        if not label or not re.match(r"^https?://", url):
+            await update.message.reply_text(
+                "❌ URL must start with http:// or https://. "
+                "Use: Label | https://t.me/username"
+            )
+            return WAIT_ADMIN_VALUE
+
+        await asyncio.to_thread(db_add_support_contact, label, url)
+        context.user_data.pop("admin_edit_target", None)
+        await update.message.reply_text(f"✅ Support contact added: {label}")
+        return ConversationHandler.END
+
+    context.user_data.pop("admin_edit_target", None)
+    await update.message.reply_text("❌ Nothing to update. Open the Admin Panel again.")
+    return ConversationHandler.END
+
+
+# ---------------------------------------------------------
 # MAIN MENU TEXT ROUTER
 # ---------------------------------------------------------
 async def handle_menu_options(
@@ -738,14 +1030,17 @@ async def handle_menu_options(
                     "❓ Gmail Cancel", callback_data="sup_gmail_cancel"
                 )
             ],
-            [
-                InlineKeyboardButton(
-                    "🧑‍💻 Technical Support", url="https://t.me/telegram"
-                )
-            ],
         ]
+        contacts = await asyncio.to_thread(db_list_support_contacts)
+        for _contact_id, label, url in contacts:
+            keyboard.append([InlineKeyboardButton(f"🧑‍💻 {label}", url=url)])
+
+        msg_text = "🔰 <b>Select Support Option:</b>"
+        if not contacts:
+            msg_text += "\n\n<i>No direct contact added yet — use the options above.</i>"
+
         await update.message.reply_text(
-            "🔰 <b>Select Support Option:</b>",
+            msg_text,
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup(keyboard),
         )
@@ -798,10 +1093,12 @@ async def handle_menu_options(
         )
 
     elif text == "👥 REFER":
+        settings = await asyncio.to_thread(db_get_all_settings)
+        referral_reward = float(settings["referral_reward"])
         ref_link = f"https://t.me/{BOT_USERNAME}?start=Bot{user.id}"
         msg_text = (
             f"🎯 <b>Referral System</b>\n\n"
-            f"Earn <b>{REFERRAL_REWARD} Tk</b> for every active user you invite!\n\n"
+            f"Earn <b>{referral_reward} Tk</b> for every active user you invite!\n\n"
             f"🔗 <b>Your Invite Link:</b>\n<code>{ref_link}</code>"
         )
         keyboard = [
@@ -818,26 +1115,13 @@ async def handle_menu_options(
         )
 
     elif text == "💲 GMAIL PRICES":
+        settings = await asyncio.to_thread(db_get_all_settings)
         await update.message.reply_text(
-            f"📊 <b>Current Gmail Prices</b>\n\n📧 <b>OLD GMAIL:</b> {GMAIL_PRICE_OLD} Tk\n📧 <b>NEW GMAIL:</b> {GMAIL_PRICE_NEW} Tk",
+            f"📊 <b>Current Gmail Prices</b>\n\n"
+            f"📧 <b>OLD GMAIL:</b> {settings['gmail_price_old']} Tk\n"
+            f"📧 <b>NEW GMAIL:</b> {settings['gmail_price_new']} Tk",
             parse_mode="HTML",
         )
-
-    elif text == "⚙️ ADMIN PANEL":
-        if not is_admin(user.id):
-            return
-        stats = await asyncio.to_thread(db_get_admin_stats)
-        msg_text = (
-            "⚙️ <b>Admin Panel</b>\n━━━━━━━\n"
-            f"👥 <b>Total Users:</b> {stats['total_users']}\n"
-            f"💰 <b>Total User Balance:</b> {stats['total_balance']} Tk\n"
-            f"📨 <b>Pending Submissions:</b> {stats['pending_subs']}\n"
-            f"💳 <b>Pending Withdrawals:</b> {stats['pending_wdrs']}\n\n"
-            f"📧 <b>NEW GMAIL Price:</b> {GMAIL_PRICE_NEW} Tk\n"
-            f"📧 <b>OLD GMAIL Price:</b> {GMAIL_PRICE_OLD} Tk\n"
-            f"👥 <b>Referral Bonus:</b> {REFERRAL_REWARD} Tk"
-        )
-        await update.message.reply_text(msg_text, parse_mode="HTML")
 
 
 # ---------------------------------------------------------
@@ -854,7 +1138,7 @@ async def handle_universal_callbacks(
     if data == "sup_buy_gmail":
         await query.answer()
         await query.message.reply_text(
-            "🛒 <b>Buy Gmail Accounts</b>\n\nTo purchase bulk Gmail accounts, contact support directly at @telegram.",
+            "🛒 <b>Buy Gmail Accounts</b>\n\nTo purchase bulk Gmail accounts, use one of the support contacts above.",
             parse_mode="HTML",
         )
     elif data == "sup_gmail_cancel":
@@ -876,6 +1160,9 @@ async def handle_universal_callbacks(
             await query.answer("Task expired.", show_alert=True)
             return
 
+        settings = await asyncio.to_thread(db_get_all_settings)
+        price_new = float(settings["gmail_price_new"])
+
         sub_id = f"SUB_{user.id}_{random.randint(10000, 99999)}"
         await asyncio.to_thread(
             db_insert_submission,
@@ -883,7 +1170,7 @@ async def handle_universal_callbacks(
             user.id,
             creds["email"],
             creds["password"],
-            GMAIL_PRICE_NEW,
+            price_new,
         )
 
         await query.answer("Submitted!")
@@ -899,7 +1186,7 @@ async def handle_universal_callbacks(
             f"🆔 <b>User ID:</b> <code>{user.id}</code>\n"
             f"✉️ <b>Email:</b> <code>{creds['email']}</code>\n"
             f"🔑 <b>Password:</b> <code>{creds['password']}</code>\n"
-            f"💰 <b>Reward:</b> {GMAIL_PRICE_NEW} Tk\n"
+            f"💰 <b>Reward:</b> {price_new} Tk\n"
             "━━━━━━━━━━━━━━━━━━━━━━"
         )
         keyboard = InlineKeyboardMarkup(
@@ -932,12 +1219,12 @@ async def handle_universal_callbacks(
         result = await asyncio.to_thread(db_approve_submission, sub_id)
 
         if result:
-            sub_user_id, reward, referrer_id = result
+            sub_user_id, reward, referrer_id, referral_bonus = result
 
             if referrer_id:
                 await context.bot.send_message(
                     chat_id=referrer_id,
-                    text=f"🎉 <b>Referral Bonus!</b> You earned <b>+{REFERRAL_REWARD} Tk</b> for an active referral.",
+                    text=f"🎉 <b>Referral Bonus!</b> You earned <b>+{referral_bonus} Tk</b> for an active referral.",
                     parse_mode="HTML",
                 )
 
@@ -1080,8 +1367,32 @@ def main():
         ],
     )
 
+    admin_conv = ConversationHandler(
+        entry_points=[
+            MessageHandler(filters.Regex("^⚙️ ADMIN PANEL$"), open_admin_panel)
+        ],
+        states={
+            ADMIN_MENU: [
+                CallbackQueryHandler(
+                    handle_admin_menu_callback, pattern="^adm_menu_"
+                )
+            ],
+            WAIT_ADMIN_VALUE: [
+                MessageHandler(
+                    filters.TEXT & ~filters.COMMAND & MENU_FILTER,
+                    receive_admin_value,
+                )
+            ],
+        },
+        fallbacks=[
+            CommandHandler("cancel", cancel_flow),
+            MessageHandler(~MENU_FILTER, cancel_flow),
+        ],
+    )
+
     app.add_handler(old_gmail_conv)
     app.add_handler(withdraw_conv)
+    app.add_handler(admin_conv)
     app.add_handler(CallbackQueryHandler(handle_universal_callbacks))
     app.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, handle_menu_options)
