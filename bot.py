@@ -498,6 +498,44 @@ async def check_membership(
         return False
 
 
+def build_join_prompt():
+    keyboard = [
+        [
+            InlineKeyboardButton(
+                "📢 Join Channel", url=f"https://t.me/{CHANNEL_USERNAME}"
+            )
+        ],
+        [InlineKeyboardButton("🔑 Verify Account", callback_data="verify_user")],
+    ]
+    text = (
+        "⚠️ <b>Join First, Then Verify</b>\n\n"
+        "✅ Join Channel ➔ Then Click Verify"
+    )
+    return text, InlineKeyboardMarkup(keyboard)
+
+
+async def ensure_active_user(
+    chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TYPE
+) -> bool:
+    """Guarantees a users row exists and channel membership is still current.
+    A stale keyboard/message can let a user tap into the bot without a fresh
+    /start — this re-checks both on every menu action, not just at /start, so
+    a user who left the channel (or whose row never existed) gets bounced
+    back to Join/Verify instead of silently using paid features or having
+    actions succeed with no users row to credit. Returns False and sends the
+    Join/Verify prompt if the check fails — callers must stop processing."""
+    await asyncio.to_thread(get_or_create_user, user_id)
+
+    if await check_membership(user_id, context):
+        return True
+
+    text, markup = build_join_prompt()
+    await context.bot.send_message(
+        chat_id=chat_id, text=text, parse_mode="HTML", reply_markup=markup
+    )
+    return False
+
+
 # ---------------------------------------------------------
 # START & REFERRAL PARSING
 # ---------------------------------------------------------
@@ -517,27 +555,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if await check_membership(user_id, context):
         await send_home_menu(update.effective_chat.id, context)
     else:
-        keyboard = [
-            [
-                InlineKeyboardButton(
-                    "📢 Join Channel",
-                    url=f"https://t.me/{CHANNEL_USERNAME}",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    "🔑 Verify Account", callback_data="verify_user"
-                )
-            ],
-        ]
-        text = (
-            "⚠️ <b>Join First, Then Verify</b>\n\n"
-            "✅ Join Channel ➔ Then Click Verify"
-        )
+        text, markup = build_join_prompt()
         await update.message.reply_text(
-            text=text,
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup(keyboard),
+            text=text, parse_mode="HTML", reply_markup=markup
         )
 
 
@@ -546,6 +566,9 @@ async def handle_verification(
 ):
     query = update.callback_query
     user_id = query.from_user.id
+    # Reachable from an old cached "Verify Account" button — guarantee the
+    # users row exists even if this wasn't preceded by /start on this instance.
+    await asyncio.to_thread(get_or_create_user, user_id)
 
     if await check_membership(user_id, context):
         await query.answer("Verification Successful!")
@@ -605,6 +628,14 @@ async def handle_new_gmail_sell(
 async def start_old_gmail_sell(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ):
+    # This is its own conversation entry point, separate from
+    # handle_menu_options — reachable directly from a stale keyboard, so it
+    # needs its own re-check.
+    if not await ensure_active_user(
+        update.effective_chat.id, update.effective_user.id, context
+    ):
+        return ConversationHandler.END
+
     await update.message.reply_text(
         "📨 <b>Sell Old Gmail Account</b>\n\n"
         "Please reply with the <b>Gmail address</b>:\n"
@@ -697,6 +728,10 @@ async def start_withdraw_callback(
 
     method = query.data.replace("withdraw_", "").upper()
     user_id = query.from_user.id
+    # Own conversation entry point, reachable from an old cached inline
+    # keyboard — re-check before reading balance.
+    if not await ensure_active_user(query.message.chat_id, user_id, context):
+        return ConversationHandler.END
     balance = await asyncio.to_thread(get_user_balance, user_id)
 
     if balance <= 0:
@@ -1013,6 +1048,11 @@ async def handle_menu_options(
 ):
     text = update.message.text
     user = update.effective_user
+    # A returning user can tap a menu button from a stale keyboard without
+    # ever sending /start (or after leaving the channel) — re-verify before
+    # anything here touches balance.
+    if not await ensure_active_user(update.effective_chat.id, user.id, context):
+        return
     balance = await asyncio.to_thread(get_user_balance, user.id)
 
     if text == "📧 NEW GMAIL SELL":
@@ -1133,6 +1173,16 @@ async def handle_universal_callbacks(
     query = update.callback_query
     data = query.data
     user = query.from_user
+
+    # Same reasoning as handle_menu_options: a stale message from a previous
+    # bot instance, or a channel-leave, can let a user act without a valid
+    # users row / current membership. Skip this for admin (adm_*) actions —
+    # those are already gated by is_admin() below and must not be blocked by
+    # the *submitter's* channel status.
+    if not data.startswith("adm_"):
+        if not await ensure_active_user(query.message.chat_id, user.id, context):
+            await query.answer()
+            return
 
     # Support Menu Interactive Responses
     if data == "sup_buy_gmail":
