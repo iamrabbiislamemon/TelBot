@@ -1,4 +1,5 @@
 import asyncio
+import html
 import logging
 import os
 import random
@@ -368,6 +369,15 @@ def db_get_admin_stats():
             "pending_wdrs": pending_wdrs,
             "total_balance": total_balance,
         }
+    finally:
+        conn.close()
+
+
+def db_list_all_user_ids():
+    conn = get_db_connection()
+    try:
+        rows = conn.execute("SELECT user_id FROM users").fetchall()
+        return [row[0] for row in rows]
     finally:
         conn.close()
 
@@ -860,6 +870,7 @@ def build_admin_main_menu() -> InlineKeyboardMarkup:
                     "🛠 Support Contacts", callback_data="adm_menu_support"
                 )
             ],
+            [InlineKeyboardButton("📢 Broadcast", callback_data="adm_menu_broadcast")],
             [InlineKeyboardButton("📊 Stats", callback_data="adm_menu_stats")],
             [InlineKeyboardButton("✖️ Close", callback_data="adm_menu_close")],
         ]
@@ -907,6 +918,28 @@ ADMIN_EDIT_TARGETS = {
     "adm_menu_price_old": ("gmail_price_old", "Old Gmail Price"),
     "adm_menu_referral": ("referral_reward", "Referral Bonus"),
 }
+
+
+async def run_broadcast(bot, admin_chat_id: int, text: str):
+    user_ids = await asyncio.to_thread(db_list_all_user_ids)
+    sent, failed = 0, 0
+    for uid in user_ids:
+        try:
+            await bot.send_message(chat_id=uid, text=text)
+            sent += 1
+        except Exception:
+            failed += 1
+        await asyncio.sleep(0.05)
+
+    await bot.send_message(
+        chat_id=admin_chat_id,
+        text=(
+            f"✅ <b>Broadcast Complete</b>\n\n"
+            f"📤 Sent: {sent}\n"
+            f"❌ Failed (blocked/deleted): {failed}"
+        ),
+        parse_mode="HTML",
+    )
 
 
 async def handle_admin_menu_callback(
@@ -991,6 +1024,46 @@ async def handle_admin_menu_callback(
         )
         return WAIT_ADMIN_VALUE
 
+    if data == "adm_menu_broadcast":
+        await query.answer()
+        context.user_data["admin_edit_target"] = "broadcast_message"
+        await query.edit_message_text(
+            "📢 <b>Broadcast Message</b>\n\n"
+            "Reply with the message to send to <b>all users</b>. "
+            "Sent as plain text — no formatting.",
+            parse_mode="HTML",
+        )
+        return WAIT_ADMIN_VALUE
+
+    if data == "adm_menu_broadcast_cancel":
+        context.user_data.pop("broadcast_text", None)
+        await query.answer("Canceled.")
+        await query.edit_message_text("❌ Broadcast canceled.")
+        return ConversationHandler.END
+
+    if data == "adm_menu_broadcast_confirm":
+        broadcast_text = context.user_data.pop("broadcast_text", None)
+        if not broadcast_text:
+            await query.answer()
+            await query.edit_message_text(
+                "❌ Nothing to send. Open the Admin Panel again."
+            )
+            return ConversationHandler.END
+
+        await query.answer("Sending...")
+        await query.edit_message_text(
+            "📤 Broadcast started — running in the background so the bot "
+            "stays responsive to other users. A summary will follow here."
+        )
+        # Runs as a background task (not awaited) so this handler returns
+        # immediately — otherwise PTB processes updates one at a time by
+        # default, and a broadcast to many users would freeze the bot for
+        # everyone else until every send completed.
+        context.application.create_task(
+            run_broadcast(context.bot, query.from_user.id, broadcast_text)
+        )
+        return ConversationHandler.END
+
     await query.answer()
     return ADMIN_MENU
 
@@ -1034,6 +1107,31 @@ async def receive_admin_value(update: Update, context: ContextTypes.DEFAULT_TYPE
         context.user_data.pop("admin_edit_target", None)
         await update.message.reply_text(f"✅ Support contact added: {label}")
         return ConversationHandler.END
+
+    if target == "broadcast_message":
+        context.user_data.pop("admin_edit_target", None)
+        context.user_data["broadcast_text"] = update.message.text
+        user_ids = await asyncio.to_thread(db_list_all_user_ids)
+        await update.message.reply_text(
+            f"📢 <b>Confirm Broadcast</b>\n\n"
+            f"This will be sent to <b>{len(user_ids)}</b> users:\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━\n{html.escape(update.message.text)}\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton(
+                            "✅ Send", callback_data="adm_menu_broadcast_confirm"
+                        ),
+                        InlineKeyboardButton(
+                            "❌ Cancel", callback_data="adm_menu_broadcast_cancel"
+                        ),
+                    ]
+                ]
+            ),
+        )
+        return ADMIN_MENU
 
     context.user_data.pop("admin_edit_target", None)
     await update.message.reply_text("❌ Nothing to update. Open the Admin Panel again.")
