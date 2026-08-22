@@ -43,6 +43,7 @@ DEFAULT_SETTINGS = {
     "gmail_price_new": "20.0",
     "gmail_price_old": "25.0",
     "referral_reward": "2.0",
+    "group_chat_id": "",
 }
 
 # Conversation States
@@ -461,6 +462,59 @@ def is_admin(user_id: int) -> bool:
     return user_id == ADMIN_CHAT_ID
 
 
+# ---------------------------------------------------------
+# GROUP MODERATION (used inside a group the bot is admin of, not the
+# private admin panel — triggered as a reply to the target's message so
+# there's no need to know their numeric user ID)
+# ---------------------------------------------------------
+async def cmd_ban(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.type not in ("group", "supergroup"):
+        return
+    if not is_admin(update.effective_user.id):
+        return
+    if not update.message.reply_to_message:
+        await update.message.reply_text(
+            "⚠️ Reply to the user's message with /ban to remove them."
+        )
+        return
+
+    target = update.message.reply_to_message.from_user
+    try:
+        await context.bot.ban_chat_member(
+            chat_id=update.effective_chat.id, user_id=target.id
+        )
+        await update.message.reply_text(
+            f"🚫 Banned {target.first_name} (<code>{target.id}</code>).",
+            parse_mode="HTML",
+        )
+    except Exception as e:
+        await update.message.reply_text(f"❌ Couldn't ban: {e}")
+
+
+async def cmd_unban(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.type not in ("group", "supergroup"):
+        return
+    if not is_admin(update.effective_user.id):
+        return
+    if not update.message.reply_to_message:
+        await update.message.reply_text(
+            "⚠️ Reply to the user's message with /unban to lift their ban."
+        )
+        return
+
+    target = update.message.reply_to_message.from_user
+    try:
+        await context.bot.unban_chat_member(
+            chat_id=update.effective_chat.id, user_id=target.id, only_if_banned=True
+        )
+        await update.message.reply_text(
+            f"✅ Unbanned {target.first_name} (<code>{target.id}</code>).",
+            parse_mode="HTML",
+        )
+    except Exception as e:
+        await update.message.reply_text(f"❌ Couldn't unban: {e}")
+
+
 def generate_gmail_credentials():
     first_name = random.choice(FIRST_NAMES)
     last_name = random.choice(LAST_NAMES)
@@ -871,10 +925,40 @@ def build_admin_main_menu() -> InlineKeyboardMarkup:
                 )
             ],
             [InlineKeyboardButton("📢 Broadcast", callback_data="adm_menu_broadcast")],
+            [InlineKeyboardButton("🏘 Group", callback_data="adm_menu_group")],
             [InlineKeyboardButton("📊 Stats", callback_data="adm_menu_stats")],
             [InlineKeyboardButton("✖️ Close", callback_data="adm_menu_close")],
         ]
     )
+
+
+def build_group_submenu(group_chat_id: str) -> tuple:
+    text = (
+        "🏘 <b>Group</b>\n━━━━━━━\n"
+        f"Configured Group ID: <code>{group_chat_id or 'not set'}</code>\n\n"
+        "Note: Telegram doesn't let bots list every group member (privacy "
+        "restriction) — Group Info below shows the member count and admin "
+        "list instead, the closest available substitute.\n\n"
+        "To remove a scammer/spammer from the group itself, reply to their "
+        "message there with <code>/ban</code> (or <code>/unban</code> to undo)."
+    )
+    markup = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "🆔 Set Group ID", callback_data="adm_menu_group_setid"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "📤 Post to Group", callback_data="adm_menu_group_post"
+                )
+            ],
+            [InlineKeyboardButton("ℹ️ Group Info", callback_data="adm_menu_group_info")],
+            [InlineKeyboardButton("⬅️ Back", callback_data="adm_menu_back")],
+        ]
+    )
+    return text, markup
 
 
 async def build_support_submenu():
@@ -1064,6 +1148,70 @@ async def handle_admin_menu_callback(
         )
         return ConversationHandler.END
 
+    if data == "adm_menu_group":
+        await query.answer()
+        settings = await asyncio.to_thread(db_get_all_settings)
+        text, markup = build_group_submenu(settings["group_chat_id"])
+        await query.edit_message_text(text, parse_mode="HTML", reply_markup=markup)
+        return ADMIN_MENU
+
+    if data == "adm_menu_group_setid":
+        await query.answer()
+        context.user_data["admin_edit_target"] = "group_chat_id"
+        await query.edit_message_text(
+            "🆔 <b>Set Group ID</b>\n\n"
+            "Add the bot to the group as admin, then reply with the group's "
+            "numeric chat ID (looks like <code>-1001234567890</code>).",
+            parse_mode="HTML",
+        )
+        return WAIT_ADMIN_VALUE
+
+    if data == "adm_menu_group_post":
+        settings = await asyncio.to_thread(db_get_all_settings)
+        if not settings["group_chat_id"]:
+            await query.answer("Set the Group ID first.", show_alert=True)
+            return ADMIN_MENU
+
+        await query.answer()
+        context.user_data["admin_edit_target"] = "group_post"
+        await query.edit_message_text(
+            "📤 <b>Post to Group</b>\n\nReply with the message to send. Sent as "
+            "plain text — no formatting.",
+            parse_mode="HTML",
+        )
+        return WAIT_ADMIN_VALUE
+
+    if data == "adm_menu_group_info":
+        settings = await asyncio.to_thread(db_get_all_settings)
+        group_chat_id = settings["group_chat_id"]
+        if not group_chat_id:
+            await query.answer("Set the Group ID first.", show_alert=True)
+            return ADMIN_MENU
+
+        await query.answer()
+        try:
+            member_count = await context.bot.get_chat_member_count(group_chat_id)
+            admins = await context.bot.get_chat_administrators(group_chat_id)
+            admin_lines = "\n".join(
+                f"• {a.user.first_name} (<code>{a.user.id}</code>)" for a in admins
+            )
+            text = (
+                f"ℹ️ <b>Group Info</b>\n━━━━━━━\n"
+                f"👥 <b>Members:</b> {member_count}\n\n"
+                f"<b>Admins:</b>\n{admin_lines}"
+            )
+        except Exception as e:
+            text = f"❌ Couldn't fetch group info: {e}"
+
+        await query.edit_message_text(
+            text,
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("⬅️ Back", callback_data="adm_menu_group")]]
+            ),
+        )
+        return ADMIN_MENU
+
     await query.answer()
     return ADMIN_MENU
 
@@ -1132,6 +1280,34 @@ async def receive_admin_value(update: Update, context: ContextTypes.DEFAULT_TYPE
             ),
         )
         return ADMIN_MENU
+
+    if target == "group_chat_id":
+        try:
+            group_id = int(text)
+            if group_id >= 0:
+                raise ValueError
+        except ValueError:
+            await update.message.reply_text(
+                "❌ Group chat IDs are negative numbers, e.g. -1001234567890."
+            )
+            return WAIT_ADMIN_VALUE
+
+        await asyncio.to_thread(db_set_setting, "group_chat_id", str(group_id))
+        context.user_data.pop("admin_edit_target", None)
+        await update.message.reply_text(f"✅ Group ID set: {group_id}")
+        return ConversationHandler.END
+
+    if target == "group_post":
+        context.user_data.pop("admin_edit_target", None)
+        settings = await asyncio.to_thread(db_get_all_settings)
+        try:
+            await context.bot.send_message(
+                chat_id=settings["group_chat_id"], text=update.message.text
+            )
+            await update.message.reply_text("✅ Posted to the group.")
+        except Exception as e:
+            await update.message.reply_text(f"❌ Couldn't post to group: {e}")
+        return ConversationHandler.END
 
     context.user_data.pop("admin_edit_target", None)
     await update.message.reply_text("❌ Nothing to update. Open the Admin Panel again.")
@@ -1467,6 +1643,8 @@ def main():
     app.add_error_handler(error_handler)
 
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("ban", cmd_ban))
+    app.add_handler(CommandHandler("unban", cmd_unban))
     app.add_handler(
         CallbackQueryHandler(handle_verification, pattern="^verify_user$")
     )
