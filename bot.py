@@ -467,6 +467,12 @@ def is_admin(user_id: int) -> bool:
 # private admin panel — triggered as a reply to the target's message so
 # there's no need to know their numeric user ID)
 # ---------------------------------------------------------
+async def cmd_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        f"Chat ID: <code>{update.effective_chat.id}</code>", parse_mode="HTML"
+    )
+
+
 async def cmd_ban(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type not in ("group", "supergroup"):
         return
@@ -1643,6 +1649,7 @@ def main():
     app.add_error_handler(error_handler)
 
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("id", cmd_id))
     app.add_handler(CommandHandler("ban", cmd_ban))
     app.add_handler(CommandHandler("unban", cmd_unban))
     app.add_handler(
